@@ -40,22 +40,39 @@ using namespace pmem;
 using namespace pmem::obj;
 using namespace std::chrono;
 
-#ifdef SAME100_BENCH
-#define DATA_FILE "../data/same100-green-pstack-ll-dfc.txt"
-#define PDATA_FILE "../data/same100-pwb-pfence-dfc.txt"
-#elif defined RANDOP
-#define DATA_FILE "../data/randop-green-pstack-ll-dfc.txt"
-#define PDATA_FILE "../data/randop-pwb-pfence-dfc.txt"
-#endif
+#define SN ""  
+#define YW ""  
+#define YCD ""  
+#define TP ""  
+#define YCC ""  
 
-#ifndef DATA_FILE
-#define DATA_FILE "../data/green-pstack-ll-dfc.txt"
-#endif
-#ifndef PDATA_FILE
-#define PDATA_FILE "../data/pwb-pfence-dfc.txt"
-#endif
+#ifdef SINGLE_NUMA
+#define SN "_1numa"  
+#endif // SINGLE_NUMA
+
+#ifdef YIELD_WAIT
+#define YW "_noBusyWait"  
+#endif // YIELD_WAIT
+
+
+#ifdef YIELD_COMBINER_DONE
+#define YCD "_yieldDone" 
+#endif // YIELD_COMBINER_DONE
+
+#ifdef THREAD_PIN
+#define TP "_pinning"  
+#endif // THREAD_PIN
+
+#ifdef YIELD_COMBINER_CPU
+#define YCC "_yieldOnlyWithComb" 
+#endif // YIELD_COMBINER_CPU
+
+#define PDATA_FILE "./data/count_dfc" YCC TP YCD YW SN ".txt"
+#define DATA_FILE "./data/dfc" YCC TP YCD YW SN ".txt"
+
+
 #ifndef PM_REGION_SIZE
-#define PM_REGION_SIZE 1024*1024*1024ULL // 1GB for now
+#define PM_REGION_SIZE 2*1024*1024*1024ULL // 2GB for now
 // #define PM_REGION_SIZE 1024*1024*128ULL
 #endif
 
@@ -68,7 +85,7 @@ using namespace std::chrono;
 #endif
 
 // #define N 8  // number of processes
-#define N 80  // number of processes
+#define N 96  // number of processes
 
 #define MAX_POOL_SIZE 4000  // number of nodes in the pool
 // #define MAX_POOL_SIZE 80  // number of nodes in the pool
@@ -701,6 +718,11 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 	auto pushpop_k_lambda = [&numThreads, &startFlag,&numPairs, &numSameOps, &proot, &pop](nanoseconds *delta, const int tid) {
 		//UserData* ud = new UserData{0,0};
 		size_t param = tid;
+	
+		#ifdef THREAD_PIN
+		synchThreadPin(tid % 20 ,tid);
+		#endif
+
 		while (!startFlag.load()) {} // Spin until the startFlag is set
 		// Measurement phase
 		auto startBeats = steady_clock::now();
@@ -724,6 +746,11 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 
 	auto randop_lambda = [&numThreads, &startFlag,&numPairs, &proot, &pop](nanoseconds *delta, const int tid) {
 		size_t param = tid;
+	
+		#ifdef THREAD_PIN
+		synchThreadPin(tid % 20 ,tid);
+		#endif
+
 		while (!startFlag.load()) {} // Spin until the startFlag is set
 		// Measurement phase
 		// thread_local int operations[2 * numPairs/numThreads];
@@ -826,7 +853,7 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 int runSeveralTests() {
     const std::string dataFilename { DATA_FILE };
 	const std::string pdataFilename { PDATA_FILE };
-	std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 24, 32, 40 };     // For Castor
+	std::vector<int> threadList = { 1, 16 , 24 ,  36 , 48 , 60, 72 , 84 , 96 };     // For Castor
     // std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 40};     // For Castor
 	// std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 64, 68, 72, 76, 80 };     // For Castor
     const int numRuns = 10;                                           // Number of runs
