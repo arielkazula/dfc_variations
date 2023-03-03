@@ -9,7 +9,6 @@
  * SINGLE_NUMA
  * THREAD_PIN
  * YIELD_COMBINER_CPU
- * READ_LESS
  * YIELD_COMBINER_DONE
  *
  */
@@ -457,132 +456,7 @@ void update_free_nodes(persistent_ptr<detectable_fc> dfc, size_t opEpoch) {
 	}
 }
 
-#define READ_LESS //TODO TMP
 
-#ifdef READ_LESS
-
-size_t combine(persistent_ptr<detectable_fc> dfc, size_t opEpoch, pmem::obj::pool<root> pop, size_t pid) {
-	l_combining_counter ++;
-    size_t epoch = dfc->cEpoch;
-	int top_index = reduce(dfc);
-	persistent_ptr<node> head = dfc->top[(epoch/2)%2];
-	if (top_index != 0) {
-		if (top_index > 0) { // push
-			top_index = top_index - 1;
-			do {
-				size_t cId = pushList[top_index];
-
-				uint64_t pos = -1;
-
-				uint64_t n = free_nodes_log_h1;
-				uint64_t temp_pos_h1 = log2(n & -n);
-				if (temp_pos_h1 >= 64) {
-					std::cerr << "No free nodes / Pool size must be at most 4096 nodes." << std::endl;
-					exit(-1);
-				}
-				n = free_nodes_log[temp_pos_h1];
-				uint64_t temp_pos = log2(n & -n);
-				pos = temp_pos + temp_pos_h1*64;
-				if (temp_pos >= 64 or pos >= MAX_POOL_SIZE) {
-					std::cerr << "No free nodes." << std::endl;
-					exit(-1);
-				}
-
-				auto newNode = dfc->nodes_pool[pos];
-				short validOp = collectedValid[cId];
-				auto currentObj = ANN(dfc, cId, validOp);
-				size_t newParam = currentObj->param;
-
-				newNode->param = newParam;
-				newNode->next = head;
-
-				n = free_nodes_log[pos/64];
-				uint64_t p = pos % 64;
-				uint64_t b = 0UL;  // set 0 (not free)
-				uint64_t mask = 1UL << p;
-
-				free_nodes_log[pos/64] = (n & ~mask) | ((b << p) & mask);
-				n = free_nodes_log[pos/64];
-				uint64_t firstSetBit = log2(n & -n);
-				if (firstSetBit >= 64) { // no free bits in this word
-					n = free_nodes_log_h1;
-					p = pos / 64;
-					b = 0UL;
-					mask = 1UL << p;
-					free_nodes_log_h1 = (n & ~mask) | ((b << p) & mask);
-				}
-
-				currentObj->val = ACK;
-				// pwbCounter3 ++;
-				PWB(&newNode);
-				head = newNode;
-				top_index -- ;
-			} while (top_index != -1);
-		}
-		else { // pop. should convert to positive index
-			top_index = -1 * top_index - 1;
-			do {
-				size_t cId = popList[top_index];
-				if (head == NULL) {
-					ANN(dfc, cId, collectedValid[cId])->val = EMPTY;
-					// exit(-1);
-				}
-				else {
-                    size_t headParam = head->param;
-					ANN(dfc, cId, collectedValid[cId])->val = headParam;
-
-					uint64_t i = head->index;
-					uint64_t n = free_nodes_log[i/64];
-					uint64_t firstSetBit = log2(n & -n);
-					if (firstSetBit >= 64) { // no free bits in this word
-						n = free_nodes_log_h1;
-						uint64_t p = i / 64;
-						uint64_t b = 1UL;
-						uint64_t mask = 1UL << p;
-						free_nodes_log_h1 = (n & ~mask) | ((b << p) & mask);
-					}
-
-					n = free_nodes_log[i/64];
-					uint64_t p = i % 64;
-					uint64_t b = 1UL;  // set 1 (free)
-					uint64_t mask = 1UL << p;
-
-					free_nodes_log[i/64] = (n & ~mask) | ((b << p) & mask);
-
-					head = head->next;
-				}
-				top_index -- ;
-			} while (top_index != -1);
-		}
-	}
-	auto persistentHeadPointer = dfc->top + ((epoch/2 + 1) % 2) * sizeof(persistent_ptr<node>);
-	*persistentHeadPointer = head;
-	for (int i=0; i<NN; i++) { //maybe persist on line. check on optane
-		short validOp = collectedValid[i];
-		if (validOp != NONE) {
-			PWB(&ANN(dfc, i, validOp));
-		}
-	}
-	PWB(persistentHeadPointer);
-	PFENCE();
-	dfc->cEpoch = epoch + 1;
-	// this is important for the following case: the combiner updates the cEpoch, then several ops started to finish and return,
-	// BEFORE cEpoch is persisted. then, when the system recovers we can't distinguish between the following cases:
-	// 1. the combiner finished an operation and updated cEpoch (because it is not persisted), and several ops returned
-	// 2. the combiner was in a middle of the combining session (for example).
-	PWB(&dfc->cEpoch);
-	PFENCE();
-	dfc->cEpoch = epoch + 2;
-	// PWB(&dfc->cEpoch);
-	// PFENCE();
-	cLock.store(false, std::memory_order_release);
-	size_t value =  try_to_return(dfc, opEpoch, pid);
-	std::this_thread::yield(); // give the other threads a chance to add thier values
-	return value;
-}
-
-
-#else
 size_t combine(persistent_ptr<detectable_fc> dfc, size_t opEpoch, pmem::obj::pool<root> pop, size_t pid) {
 	l_combining_counter ++;
 	int top_index = reduce(dfc);
@@ -698,7 +572,6 @@ size_t combine(persistent_ptr<detectable_fc> dfc, size_t opEpoch, pmem::obj::poo
 	return value;
 }
 
-#endif // READ_LESS
 
 
 size_t op(persistent_ptr<detectable_fc> dfc, pmem::obj::pool<root> pop, size_t pid, char opName, size_t param)
