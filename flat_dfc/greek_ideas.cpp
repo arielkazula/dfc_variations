@@ -1,55 +1,30 @@
 /*
  * dfc.cpp -- Detectable Flat Combining implemented using libpmemobj C++ bindings
- *
- * -------------------------------------------------------------------------- *
- *                                 Variations                                 *
- * -------------------------------------------------------------------------- *
- * We are using multiple Configuration to compare improvement
- * The options are:
- * SINGLE_NUMA
- * THREAD_PIN
- * YIELD_COMBINER_CPU
- * YIELD_COMBINER_DONE
- * YIELD_WAIT
  */
-
-#define SINGLE_NUMA
-#define YIELD_WAIT
-#define YIELD_COMBINER_DONE
-
-#include <atomic>
+#include <sys/stat.h>
 #include <bits/stdc++.h>
-#include <chrono>
-#include <cmath>
-#include <cstdint>
+#include <atomic>
 #include <cstring>
-#include <errno.h>
-#include <fcntl.h>
+#include <cstdint>
 #include <iostream>
-#include <libpmem.h>
+#include <unistd.h>
+#include <thread>
+#include <mutex>
 #include <libpmemobj++/make_persistent_array.hpp>
 #include <libpmemobj++/make_persistent.hpp>
 #include <libpmemobj++/p.hpp>
 #include <libpmemobj++/persistent_ptr.hpp>
 #include <libpmemobj++/pool.hpp>
 #include <libpmemobj++/transaction.hpp>
-#include <mutex>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <thread>
-#include <unistd.h>
-
-#ifdef SINGLE_NUMA
-#include <numa.h>
+#include <libpmem.h>
+#include <cmath>
 #include <sched.h>
-#endif
+#include <numa.h>
 
 using namespace pmem;
 using namespace pmem::obj;
 using namespace std::chrono;
+using namespace std::literals::chrono_literals;
 
 #ifdef SAME100_BENCH
 #define DATA_FILE "../data/same100-green-pstack-ll-dfc.txt"
@@ -73,8 +48,7 @@ using namespace std::chrono;
 // Name of persistent file mapping
 #ifndef PM_FILE_NAME
 // #define PM_FILE_NAME   "/home/matanr/recov_flat_combining/poolfile"
-#define PM_FILE_NAME   "/dev/shm/list_shared"
-#define PM_FILE_NAME_2   "/dev/shm/dfc_shared"
+#define PM_FILE_NAME   "/opt/ext4/HAGIT/dfc_shared"
 // #define PM_FILE_NAME   "/dev/dax4.0"
 // #define PM_FILE_NAME   "/mnt/dfcpmem/dfc_shared"
 #endif
@@ -87,16 +61,21 @@ using namespace std::chrono;
 #define ACK -1
 #define EMPTY -2
 #define NONE -3
+#define LOCKED -4
 #define PUSH_OP 1
 #define POP_OP 0
+#define NO_OP -1
 
-#define VALID_ANN(dfc, i)   dfc->announce_arr[i].announces[dfc->announce_arr[i].valid % 10]
-#define ANN(dfc, i, valid)   dfc->announce_arr[i].announces[valid % 10]
+//#define VALID_ANN(dfc, i)   announce_arr[i].announces[announce_arr[i].valid % 10]
+//#define ANN(dfc, i, valid)   announce_arr[i].announces[valid % 10]
 
 
 int NN = N;  // number of processes running now
 const int num_words = MAX_POOL_SIZE / 64 + 1;
 uint64_t free_nodes_log [num_words];
+
+int pushList[N];
+int popList[N];
 
 uint64_t free_nodes_log_h1;
 
@@ -161,11 +140,6 @@ std::atomic<bool> cLock {false};    // holds true when locked, holds false when 
 std::atomic<int> gRecoveryLock {0}; // holds 1 when locked, holds 0 when unlocked, holds 2 when it was locked once
 std::mutex pLock; // Used to add local PWB and PFENCE instructions count to the global variables
 
-#ifdef YIELD_COMBINER_CPU
-std::mutex cpuLock;
-int combiner_cpu = -1;
-#endif // YIELD_COMBINER_CPU
-
 thread_local int localPwbCounter = 0;
 thread_local int localPfenceCounter = 0;
 int pwbCounter = 0;
@@ -179,28 +153,21 @@ int pfenceParallelCounter = 0;
 thread_local int l_combining_counter = 0;
 int combining_counter = 0;
 
-int pushList[N];
-int popList[N];
-short collectedValid[N];
-
-// struct alignas(32) announce {
-struct announce {
-    size_t val;
+struct alignas(64) announce {
     size_t epoch;
+	size_t name;
     size_t param;
-	char name;
-};
-
-struct alignas(64) transactional_announce {
-    announce announces [2];
-	short valid{0};
+	bool activate;
+	bool valid;
 } ;
 
-struct detectable_fc {
-	size_t cEpoch{0};
-	transactional_announce announce_arr [N];
-};
+announce announce_arr [N];
+//size_t the_combiner = -1;
 
+/*struct alignas(64) transactional_announce {
+    persistent_ptr<announce> announces [2];
+	p<short> valid;
+} ;*/
 
 struct node {
     p<size_t> param;
@@ -208,42 +175,58 @@ struct node {
     p<uint64_t> index;
 } ;
 
-struct detectable_list {
-	persistent_ptr<node> top [2];
+struct state_rec {
+	persistent_ptr<node> top;
+	p<size_t> return_val[N];
+	p<bool> deactivate[N];
+};
+struct detectable_fc {
+	p<size_t> cEpoch = 0;
+	p<size_t> m_index = 0;
+	persistent_ptr <state_rec> mem_state [2];
 	persistent_ptr<node> nodes_pool [MAX_POOL_SIZE];
 };
 
-#ifdef THREAD_PIN
+// pool root structure
+struct root {
+	persistent_ptr<detectable_fc> dfc;
+};
 
-	int synchThreadPin(int32_t cpu_id, int pid) {
-		int ret = 0;
-		cpu_set_t mask;
-		unsigned int len = sizeof(mask);
+int synchThreadPin(int32_t cpu_id, int pid) {
+    int ret = 0;
+    cpu_set_t mask;
+    unsigned int len = sizeof(mask);
 
-		pthread_setconcurrency(10);
-		CPU_ZERO(&mask);
-		static __thread int32_t __prefered_core = cpu_id;
-		CPU_SET(__prefered_core, &mask);
-	// fprintf(stderr, "DEBUG: thread: %d -- numa_node: %d -- core: %d\n", cpu_id, numa_node_of_cpu(__prefered_core), __prefered_core);
-		ret = sched_setaffinity(0, len, &mask);
-		if (ret == -1)
-			perror("sched_setaffinity");
+    pthread_setconcurrency(10);
+    CPU_ZERO(&mask);
+    static __thread int32_t __prefered_core = cpu_id;
+    CPU_SET(__prefered_core, &mask);
+   // fprintf(stderr, "DEBUG: thread: %d -- numa_node: %d -- core: %d\n", cpu_id, numa_node_of_cpu(__prefered_core), __prefered_core);
+    ret = sched_setaffinity(0, len, &mask);
+    if (ret == -1)
+        perror("sched_setaffinity");
 
-		return ret;
+    return ret;
+}
+
+void copy_old_state(persistent_ptr<state_rec> old_state, persistent_ptr<state_rec> new_state) {
+	new_state->top = old_state->top;
+	for (int i = 0; i < N; i++) {
+		new_state->return_val[i] = old_state->return_val[i];
+		new_state->deactivate[i] = old_state->deactivate[i];
 	}
+}
 
-#endif
+size_t try_to_return(persistent_ptr<detectable_fc> dfc, size_t & opEpoch, size_t pid);
+size_t try_to_take_lock(persistent_ptr<detectable_fc> dfc, size_t & opEpoch, size_t pid);
 
-size_t try_to_return(detectable_fc* dfc, size_t & opEpoch, size_t pid);
-size_t try_to_take_lock(detectable_fc* dfc, size_t & opEpoch, size_t pid);
-
-void print_state(detectable_fc* dfc, persistent_ptr<detectable_list> list) {
+void print_state(persistent_ptr<detectable_fc> dfc) {
     size_t opEpoch = dfc->cEpoch;
     if (opEpoch % 2 == 1) {
         opEpoch ++;
     }
     std::cout << "~~~ Printing state of epoh: " << opEpoch << " ~~~" << std::endl;
-    auto current = list->top[(opEpoch/2)%2];
+    auto current = dfc->mem_state[dfc->m_index]->top;
 	int counter = 0;
     while (current != NULL) {
         std::cout << "Param: " << current->param << std::endl;
@@ -252,14 +235,27 @@ void print_state(detectable_fc* dfc, persistent_ptr<detectable_list> list) {
     }
 }
 
-void transaction_allocations(persistent_ptr<detectable_list> list, pmem::obj::pool<detectable_list> pop) {
+void transaction_allocations(persistent_ptr<root> proot, pmem::obj::pool<root> pop) {
 	transaction::run(pop, [&] {
 		// allocation
+		proot->dfc = make_persistent<detectable_fc>();
+		proot->dfc->mem_state[0] = make_persistent<state_rec>();
+		proot->dfc->mem_state[0]->top = NULL;
+		proot->dfc->mem_state[1] = make_persistent<state_rec>();
+		proot->dfc->mem_state[1]->top = NULL;
+
+		for (int pid = 0; pid < N; pid++) {
+			proot->dfc->mem_state[0]->return_val[pid] = NONE;
+			proot->dfc->mem_state[0]->deactivate[pid] = 0;
+			proot->dfc->mem_state[1]->return_val[pid] = NONE;
+			proot->dfc->mem_state[1]->deactivate[pid] = 0;
+		}
+
 		for (int i=0; i < MAX_POOL_SIZE; i++) {
-			list->nodes_pool[i] = make_persistent<node>();
-			list->nodes_pool[i]->param = NONE;
-			list->nodes_pool[i]->next = NULL;
-			list->nodes_pool[i]->index = i;
+			proot->dfc->nodes_pool[i] = make_persistent<node>();
+			proot->dfc->nodes_pool[i]->param = NONE;
+			proot->dfc->nodes_pool[i]->next = NULL;
+			proot->dfc->nodes_pool[i]->index = i;
 		}
 		for (int i=0; i < num_words; i++) {
 			free_nodes_log[i] = ~0UL;
@@ -269,112 +265,94 @@ void transaction_allocations(persistent_ptr<detectable_list> list, pmem::obj::po
 }
 
 
-void transaction_deallocations(persistent_ptr<detectable_list> list, pmem::obj::pool<detectable_list> pop) {
+void transaction_deallocations(persistent_ptr<root> proot, pmem::obj::pool<root> pop) {
 	transaction::run(pop, [&] {
+
+		delete_persistent<state_rec>(proot->dfc->mem_state[0]);
+		delete_persistent<state_rec>(proot->dfc->mem_state[1]);
 		for (int i=0; i < MAX_POOL_SIZE; i++) {
-			delete_persistent<node>(list->nodes_pool[i]);
+			delete_persistent<node>(proot->dfc->nodes_pool[i]);
 		}
 		for (int i=0; i < num_words; i++) {
 			free_nodes_log[i] = ~0UL;
 		}
 		free_nodes_log_h1 = ~0UL;
+		delete_persistent<detectable_fc>(proot->dfc);
 	});
 }
 
-size_t lock_taken(detectable_fc* dfc, size_t & opEpoch, bool combiner, size_t pid)
+size_t lock_taken(persistent_ptr<detectable_fc> dfc, size_t & opEpoch, bool combiner, size_t pid)
 {
 	if (combiner == false) {
 		while (dfc->cEpoch <= opEpoch + 1) {
-			#ifdef YIELD_WAIT
-				std::this_thread::yield();
-			#elif YIELD_COMBINER_CPU
-				cpuLock.lock();
-				int temp = combiner_cpu;
-				cpuLock.unlock();
-				if (temp == sched_getcpu()) {
-					std::this_thread::yield(); // without: faster on threads <= cores. with: keeps scaling even after threads > cores
-				}
-			#endif
+			std::this_thread::yield();
 			if (cLock.load(std::memory_order_acquire) == false && dfc->cEpoch <= opEpoch + 1){
                 return try_to_take_lock(dfc, opEpoch, pid);
 			}
 		}
 		return try_to_return(dfc, opEpoch, pid);
 	}
-	#ifdef YIELD_COMBINER_CPU
-		cpuLock.lock();
-	    combiner_cpu = sched_getcpu();
-	    cpuLock.unlock();
-	#endif
-	return NONE;
+	return LOCKED;
 }
 
-size_t try_to_take_lock(detectable_fc* dfc, size_t & opEpoch, size_t pid)
+size_t try_to_take_lock(persistent_ptr<detectable_fc> dfc, size_t & opEpoch, size_t pid)
 {
 	bool expected = false;
 	bool combiner = cLock.compare_exchange_strong(expected, true);
 	return lock_taken(dfc, opEpoch, combiner, pid);
 }
 
-size_t try_to_return(detectable_fc* dfc, size_t & opEpoch, size_t pid)
+size_t try_to_return(persistent_ptr<detectable_fc> dfc, size_t & opEpoch, size_t pid)
 {
-    // size_t val = dfc->announce_arr[pid]->val;
-	size_t val = VALID_ANN(dfc, pid).val;
-    if (val == NONE) {
+	auto current_state = dfc->mem_state[dfc->m_index];
+    if (announce_arr[pid].activate != current_state->deactivate[pid]) {
 		opEpoch += 2;
 		return try_to_take_lock(dfc, opEpoch, pid);
 	}
 	else {
-		#ifdef YIELD_COMBINER_CPU
-		cpuLock.lock();
-		combiner_cpu = -1;
-		cpuLock.unlock();
-		#endif
-		return val;
+		return current_state->return_val[pid];
 	}
 }
 
-int reduce(detectable_fc* dfc) {
+int reduce(persistent_ptr<detectable_fc> dfc, size_t pid) {
 	int top_push = -1;
 	int top_pop = -1;
 
 	for (size_t i = 0; i < NN; i++) {
-		short validOp = dfc->announce_arr[i].valid;
-		size_t opVal = ANN(dfc, i, validOp).val;
-		if ((validOp / 10 == 1) && (opVal == NONE)){
-			// size_t opEpoch = ANN(dfc, i, validOp).epoch;
-			// size_t opVal = ANN(dfc, i, validOp).val;
+		if (announce_arr[i].activate != dfc->mem_state[dfc->m_index]->deactivate[i]) {
+			// size_t opEpoch = ANN(dfc, i, validOp)->epoch;
+			// size_t opVal = ANN(dfc, i, validOp)->val;
 			// if (opEpoch == dfc->cEpoch || opVal == NONE) {
-
 			// if (opVal == NONE) {
-			ANN(dfc, i, validOp).epoch = dfc->cEpoch;
-			// PWB(&ANN(dfc, i, validOp).epoch);  // needed if there is a chance that epoch will be persisted but val not
-			char opName = ANN(dfc, i, validOp).name;
+			announce_arr[i].epoch = dfc->cEpoch;
+			// PWB(&ANN(dfc, i, validOp)->epoch);  // needed if there is a chance that epoch will be persisted but val not
+			size_t opName = announce_arr[i].name;
 			if (opName == PUSH_OP) {
 				top_push ++;
 				pushList[top_push] = i;
-				collectedValid[i] = validOp;
 			}
 			else if (opName == POP_OP) {
 				top_pop ++;
 				popList[top_pop] = i;
-				collectedValid[i] = validOp;
 			}
-		}
-		else{
-			collectedValid[i] = NONE;
 		}
 	}
 	// IMPORTANT! make sure that there is no way that a combined op will change valid after it was collected.
 	// if there is a way, we must change below the collected op and not the other struct
+	size_t ind = 1 - dfc->m_index;
 	while((top_push != -1) || (top_pop != -1)) {
 		if ((top_push != -1) && (top_pop != -1)) {
 			size_t cPush = pushList[top_push];
 			size_t cPop  = popList[top_pop];
-			short validOp = collectedValid[cPush];
-			ANN(dfc, cPush, validOp).val = ACK;
-			size_t pushParam = ANN(dfc, cPush, validOp).param;
-			ANN(dfc, cPop, collectedValid[cPop]).val = pushParam;
+			size_t pushParam = announce_arr[cPush].param;
+
+			auto next_state = dfc->mem_state[ind];
+
+			next_state->return_val[cPush] = ACK;
+			next_state->deactivate[cPush] = announce_arr[cPush].activate;
+
+			next_state->return_val[cPop] = pushParam;
+			next_state->deactivate[cPop] = announce_arr[cPop].activate;
 
 			top_push --;
 			top_pop --;
@@ -410,13 +388,13 @@ unsigned int countSetBits(uint64_t n)
 }
 
 // garbage collection, updates is_free for all nodes in the pool
-void update_free_nodes(persistent_ptr<detectable_list> list, size_t opEpoch) {
+void update_free_nodes(persistent_ptr<detectable_fc> dfc, size_t opEpoch) {
 
 	for (int i=0; i<num_words; i++) {
 		free_nodes_log[i] = ~0UL;
 	}
 	free_nodes_log_h1 = ~0UL;
-	auto current = list->top[(opEpoch/2)%2];
+	auto current = dfc->mem_state[dfc->m_index]->top;
 	while (current != NULL) {
 		uint64_t i = current->index;
 		uint64_t n = free_nodes_log[i/64];
@@ -438,14 +416,12 @@ void update_free_nodes(persistent_ptr<detectable_list> list, size_t opEpoch) {
 	}
 }
 
-
-#ifdef READ_LESS
-
-size_t combine(detectable_fc* dfc, pmem::obj::persistent_ptr<detectable_list> list, size_t opEpoch, size_t pid) {
+size_t combine(persistent_ptr<detectable_fc> dfc, size_t opEpoch, pmem::obj::pool<root> pop, size_t pid) {
 	l_combining_counter ++;
-    size_t epoch = dfc->cEpoch;
-	int top_index = reduce(dfc);
-	persistent_ptr<node> head = list->top[(epoch/2)%2];
+	size_t ind = 1 - dfc->m_index;
+	copy_old_state(dfc->mem_state[dfc->m_index], dfc->mem_state[ind]);
+	int top_index = reduce(dfc, pid);
+	persistent_ptr<node> head = dfc->mem_state[dfc->m_index]->top;
 	if (top_index != 0) {
 		if (top_index > 0) { // push
 			top_index = top_index - 1;
@@ -468,11 +444,9 @@ size_t combine(detectable_fc* dfc, pmem::obj::persistent_ptr<detectable_list> li
 					exit(-1);
 				}
 
-				auto newNode = list->nodes_pool[pos];
-				short validOp = collectedValid[cId];
-				auto currentObj = ANN(dfc, cId, validOp);
-				size_t newParam = currentObj.param;
-
+				auto newNode = dfc->nodes_pool[pos];
+				//short validOp = collectedValid[cId];
+				size_t newParam = announce_arr[cId].param; //ANN(dfc, cId, validOp)->param;
 				newNode->param = newParam;
 				newNode->next = head;
 
@@ -491,8 +465,9 @@ size_t combine(detectable_fc* dfc, pmem::obj::persistent_ptr<detectable_list> li
 					mask = 1UL << p;
 					free_nodes_log_h1 = (n & ~mask) | ((b << p) & mask);
 				}
+				dfc->mem_state[ind]->return_val[cId] = ACK;
+				dfc->mem_state[ind]->deactivate[cId] = announce_arr[cId].activate;
 
-				currentObj.val = ACK;
 				// pwbCounter3 ++;
 				PWB(&newNode);
 				head = newNode;
@@ -504,12 +479,13 @@ size_t combine(detectable_fc* dfc, pmem::obj::persistent_ptr<detectable_list> li
 			do {
 				size_t cId = popList[top_index];
 				if (head == NULL) {
-					ANN(dfc, cId, collectedValid[cId]).val = EMPTY;
-					// exit(-1);
+					dfc->mem_state[ind]->return_val[cId] = EMPTY;
+					dfc->mem_state[ind]->deactivate[cId] = announce_arr[cId].activate;
 				}
 				else {
                     size_t headParam = head->param;
-					ANN(dfc, cId, collectedValid[cId]).val = headParam;
+					dfc->mem_state[ind]->return_val[cId] = headParam;
+					dfc->mem_state[ind]->deactivate[cId] = announce_arr[cId].activate;
 
 					uint64_t i = head->index;
 					uint64_t n = free_nodes_log[i/64];
@@ -535,211 +511,97 @@ size_t combine(detectable_fc* dfc, pmem::obj::persistent_ptr<detectable_list> li
 			} while (top_index != -1);
 		}
 	}
-	auto persistentHeadPointer = list->top + ((epoch/2 + 1) % 2) * sizeof(persistent_ptr<node>);
-	*persistentHeadPointer = head;
-	pmem_persist(dfc,sizeof(dfc));
-	PWB(persistentHeadPointer);
+	dfc->mem_state[ind]->top = head;
+    PWB(&dfc->mem_state[ind]);
 	PFENCE();
-	dfc->cEpoch = epoch + 1;
+	dfc->cEpoch = dfc->cEpoch + 1;
+	dfc->m_index = ind;
 	// this is important for the following case: the combiner updates the cEpoch, then several ops started to finish and return,
 	// BEFORE cEpoch is persisted. then, when the system recovers we can't distinguish between the following cases:
 	// 1. the combiner finished an operation and updated cEpoch (because it is not persisted), and several ops returned
 	// 2. the combiner was in a middle of the combining session (for example).
-	pmem_persist(&dfc->cEpoch,sizeof(size_t));
+	PWB(&dfc->cEpoch);
+	PWB(&dfc->m_index);
 	PFENCE();
-	dfc->cEpoch = epoch + 2;
-	// PWB(&dfc->cEpoch);
-	// PFENCE();
+	dfc->cEpoch = dfc->cEpoch + 1;
 	cLock.store(false, std::memory_order_release);
-	size_t value =  try_to_return(dfc, opEpoch, pid);
-	std::this_thread::yield(); // give the other threads a chance to add thier values
-	return value;
+	return try_to_return(dfc, opEpoch, pid);
 }
 
 
-#else
-size_t combine(detectable_fc* dfc, pmem::obj::persistent_ptr<detectable_list> list, size_t opEpoch, size_t pid) {
-	l_combining_counter ++;
-	int top_index = reduce(dfc);
-	persistent_ptr<node> head = list->top[(dfc->cEpoch/2)%2];
-	if (top_index != 0) {
-		if (top_index > 0) { // push
-			top_index = top_index - 1;
-			do {
-				size_t cId = pushList[top_index];
-
-				uint64_t pos = -1;
-
-				uint64_t n = free_nodes_log_h1;
-				uint64_t temp_pos_h1 = log2(n & -n);
-				if (temp_pos_h1 >= 64) {
-					std::cerr << "No free nodes / Pool size must be at most 4096 nodes." << std::endl;
-					exit(-1);
-				}
-				n = free_nodes_log[temp_pos_h1];
-				uint64_t temp_pos = log2(n & -n);
-				pos = temp_pos + temp_pos_h1*64;
-				if (temp_pos >= 64 or pos >= MAX_POOL_SIZE) {
-					std::cerr << "No free nodes." << std::endl;
-					exit(-1);
-				}
-
-				auto newNode = list->nodes_pool[pos];
-				short validOp = collectedValid[cId];
-				size_t newParam = ANN(dfc, cId, validOp).param;
-				newNode->param = newParam;
-				newNode->next = head;
-
-				n = free_nodes_log[pos/64];
-				uint64_t p = pos % 64;
-				uint64_t b = 0UL;  // set 0 (not free)
-				uint64_t mask = 1UL << p;
-
-				free_nodes_log[pos/64] = (n & ~mask) | ((b << p) & mask);
-				n = free_nodes_log[pos/64];
-				uint64_t firstSetBit = log2(n & -n);
-				if (firstSetBit >= 64) { // no free bits in this word
-					n = free_nodes_log_h1;
-					p = pos / 64;
-					b = 0UL;
-					mask = 1UL << p;
-					free_nodes_log_h1 = (n & ~mask) | ((b << p) & mask);
-				}
-
-				ANN(dfc, cId, validOp).val = ACK;
-				// pwbCounter3 ++;
-				PWB(&newNode);
-				head = newNode;
-				top_index -- ;
-			} while (top_index != -1);
-		}
-		else { // pop. should convert to positive index
-			top_index = -1 * top_index - 1;
-			do {
-				size_t cId = popList[top_index];
-				if (head == NULL) {
-					ANN(dfc, cId, collectedValid[cId]).val = EMPTY;
-					// exit(-1);
-				}
-				else {
-                    size_t headParam = head->param;
-					ANN(dfc, cId, collectedValid[cId]).val = headParam;
-
-					uint64_t i = head->index;
-					uint64_t n = free_nodes_log[i/64];
-					uint64_t firstSetBit = log2(n & -n);
-					if (firstSetBit >= 64) { // no free bits in this word
-						n = free_nodes_log_h1;
-						uint64_t p = i / 64;
-						uint64_t b = 1UL;
-						uint64_t mask = 1UL << p;
-						free_nodes_log_h1 = (n & ~mask) | ((b << p) & mask);
-					}
-
-					n = free_nodes_log[i/64];
-					uint64_t p = i % 64;
-					uint64_t b = 1UL;  // set 1 (free)
-					uint64_t mask = 1UL << p;
-
-					free_nodes_log[i/64] = (n & ~mask) | ((b << p) & mask);
-
-					head = head->next;
-				}
-				top_index -- ;
-			} while (top_index != -1);
-		}
-	}
-	list->top[(dfc->cEpoch/2 + 1) % 2] = head;
-	pmem_persist(dfc,sizeof(dfc));
-	PWB(&list->top[(dfc->cEpoch/2 + 1) % 2]);
-	PFENCE();
-	dfc->cEpoch = dfc->cEpoch + 1;
-	// this is important for the following case: the combiner updates the cEpoch, then several ops started to finish and return,
-	// BEFORE cEpoch is persisted. then, when the system recovers we can't distinguish between the following cases:
-	// 1. the combiner finished an operation and updated cEpoch (because it is not persisted), and several ops returned
-	// 2. the combiner was in a middle of the combining session (for example).
-	pmem_persist(&dfc->cEpoch,sizeof(size_t));
-	PFENCE();
-	dfc->cEpoch = dfc->cEpoch + 1;
-	// PWB(&dfc->cEpoch);
-	// PFENCE();
-	cLock.store(false, std::memory_order_release);
-	size_t value =  try_to_return(dfc, opEpoch, pid);
-	return value;
-}
-
-#endif // READ_LESS
-
-
-size_t op(detectable_fc* dfc, pmem::obj::persistent_ptr<detectable_list> list, size_t pid, char opName, size_t param)
+size_t op(persistent_ptr<detectable_fc> dfc, pmem::obj::pool<root> pop, size_t pid, size_t opName, size_t param)
 {
 	size_t opEpoch = dfc->cEpoch;
 	if (opEpoch % 2 == 1) {
 		opEpoch ++;
 	}
 	// announce
-	char nextOp = 1 - dfc->announce_arr[pid].valid % 10;
+	//char nextOp = 1 - announce_arr[pid].valid % 10;
 
-	ANN(dfc, pid, nextOp).val = NONE;
-	ANN(dfc, pid, nextOp).epoch = opEpoch;
-	ANN(dfc, pid, nextOp).param = param;
-    ANN(dfc, pid, nextOp).name = opName;
+	announce_arr[pid].epoch = opEpoch;
+	announce_arr[pid].param = param;
+	announce_arr[pid].name = opName;
+	announce_arr[pid].valid = 1;
+	PPFENCE();
+	announce_arr[pid].activate = 1 - announce_arr[pid].activate;
 
-	pmem_persist(&ANN(dfc, pid, nextOp),sizeof(announce));
 	PPFENCE();
-	dfc->announce_arr[pid].valid = nextOp; // combiner still will not collect it
-	pmem_persist(&dfc->announce_arr[pid].valid,sizeof(short));
-	PPFENCE();
-	dfc->announce_arr[pid].valid = 10 + nextOp; // now the combiner can collect
+	//PPWB(&ANN(dfc, pid, nextOp));
+	//announce_arr[pid]->valid = nextOp; // combiner still will not collect it
+	//PPWB(&announce_arr[pid]->valid);
+	//PPFENCE();
+	//announce_arr[pid]->valid = 10 + nextOp; // now the combiner can collect
 	size_t value = try_to_take_lock(dfc, opEpoch, pid);
-	if (value != NONE){
+	if (value != LOCKED) {
 		return value;
 	}
 	opEpoch = dfc->cEpoch;  // this is important for cases in which a late-arriving process eventually gets to be a combiner
-	return combine(dfc, list, opEpoch, pid);
+	size_t result = combine(dfc, opEpoch, pop, pid);
+	return result;
 }
 
 
 // global recovery function, can be executed by the first thread via lock in the individual recovery
 // We assume that every thread runs this function right after a (system-wide) crash
-size_t recover(detectable_fc* dfc, pmem::obj::persistent_ptr<detectable_list> list, size_t pid, bool opName, size_t param)
+size_t recover(persistent_ptr<detectable_fc> dfc, pmem::obj::pool<root> pop, size_t pid, bool opName, size_t param)
 {
-	int expected = 0;
+	return 1;
+	/*int expected = 0;
 	bool globalRecovery = gRecoveryLock.compare_exchange_strong(expected, 1);
 	if (globalRecovery) {
 		// garbage collect and update what nodes are free
-		update_free_nodes(list, dfc->cEpoch);
+		update_free_nodes(dfc, dfc->cEpoch);
 		if (dfc->cEpoch%2 == 1) {
 			dfc->cEpoch = dfc->cEpoch + 1;
-			pmem_persist(&dfc->cEpoch,sizeof(size_t));
+			PWB(&dfc->cEpoch);
 			PFENCE();
 		}
 		for (int i=0; i<NN; i++) {
-			short validOp = dfc->announce_arr[i].valid;
-			size_t opEpoch = ANN(dfc, i, validOp).epoch;
+			short validOp = announce_arr[i].valid;
+			size_t opEpoch = ANN(dfc, i, validOp)->epoch;
 			if (validOp / 10 == 0 and opEpoch != NONE) { // if not valid and announced properly - make it valid, i.e. allow the combiner to collect
-				dfc->announce_arr[i].valid = 10 + validOp;
+				announce_arr[i]valid = 10 + validOp;
 			}
 			if (opEpoch == dfc->cEpoch) {
-				ANN(dfc, i, validOp).val = NONE;
+				ANN(dfc, i, validOp)->val = NONE;
 			}
 		}
 		size_t opEpoch = dfc->cEpoch;
-		combine(dfc,list, opEpoch, pid);
+		combine(dfc, opEpoch, pop, pid);
 		gRecoveryLock.store(2, std::memory_order_release);
 	}
 	else {
 		while (gRecoveryLock.load() == 1) {} // Spin until recovery is complete
 	}
-	// if (VALID_ANN(dfc, pid).epoch == NONE) {
+	// if (VALID_ANN(dfc, pid)->epoch == NONE) {
 	// 	// did not announce properly
 	// 	return op(dfc, pop, pid, opName, param);
 	// }
-	if (VALID_ANN(dfc, pid).name == NONE) {
+	if (VALID_ANN(dfc, pid)->name == NONE) {
 		// did not announce properly
-		return op(dfc, list, pid, opName, param);
+		return op(dfc, pop, pid, opName, param);
 	}
-	return VALID_ANN(dfc, pid).val;
+	return VALID_ANN(dfc, pid)->val;*/
 }
 
 
@@ -755,14 +617,12 @@ inline bool is_file_exists (const char* name) {
 std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int numThreads, const long numPairs, const int numRuns, const int numSameOps) {
 	const uint64_t kNumElements = 0; // Number of initial items in the stack
 	static const long long NSEC_IN_SEC = 1000000000LL;
-	
-	// we work with a direct accsess to the pmem here
-	detectable_fc* dfc;
-	pmem::obj::persistent_ptr<detectable_list> list;
+
+	pmem::obj::pool<root> pop;
+	pmem::obj::persistent_ptr<root> proot;
 
 	const char* pool_file_name = PM_FILE_NAME;
-	const char* pool_file_name2 = PM_FILE_NAME_2;
-	
+
     size_t params [N];
     size_t ops [N];
     std::thread threads_pool[N];
@@ -773,19 +633,14 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 
 	std::cout << "##### " << "Detectable Flat Combining" << " #####  \n";
 
-	auto pushpop_lambda = [&numThreads, &startFlag,&numPairs, &dfc,&list](nanoseconds *delta, const int tid) {
+	auto pushpop_lambda = [&numThreads, &startFlag,&numPairs, &proot, &pop](nanoseconds *delta, const int tid) {
 		size_t param = tid;
-
-		#ifdef THREAD_PIN
-		synchThreadPin(tid % 20 ,tid);
-		#endif
-
 		while (!startFlag.load()) {} // Spin until the startFlag is set
 		// Measurement phase
 		auto startBeats = steady_clock::now();
 		for (long long iter = 0; iter < numPairs/numThreads; iter++) {
-			op(dfc,list, tid, PUSH_OP, param);
-			if (op(dfc,list, tid, POP_OP, NONE) == EMPTY) std::cout << "Error at measurement pop() iter=" << iter << "\n";
+			op(proot->dfc, pop, tid, PUSH_OP, param);
+			if (op(proot->dfc, pop, tid, POP_OP, EMPTY) == EMPTY) std::cout << "Error at measurement pop() iter=" << iter << "\n";
 		}
 		auto stopBeats = steady_clock::now();
 		*delta = stopBeats - startBeats;
@@ -795,20 +650,25 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		pwbParallelCounter += localParallelPwbCounter;
 		pfenceParallelCounter += localParallelPfenceCounter;
 		combining_counter += l_combining_counter;
+		//std::cout << __LINE__ << std::endl;
 	};
 
-	auto pushpop_k_lambda = [&numThreads, &startFlag,&numPairs, &numSameOps, &dfc,&list](nanoseconds *delta, const int tid) {
+	auto pushpop_k_lambda = [&numThreads, &startFlag,&numPairs, &numSameOps, &proot, &pop](nanoseconds *delta, const int tid) {
 		//UserData* ud = new UserData{0,0};
 		size_t param = tid;
 		while (!startFlag.load()) {} // Spin until the startFlag is set
 		// Measurement phase
 		auto startBeats = steady_clock::now();
 		for (long long iter = 0; iter < numPairs/(numThreads*numSameOps); iter++) {
-			for (long iter_s = 0; iter_s < numSameOps; iter_s++) {
-				op(dfc,list, tid, PUSH_OP, param);
+			if (tid < 2) {
+				for (long iter_s = 0; iter_s < numSameOps; iter_s++) {
+					op(proot->dfc, pop, tid, PUSH_OP, param);
+				}
 			}
-			for (long iter_s = 0; iter_s < numSameOps; iter_s++) {
-				if (op(dfc,list,  tid, POP_OP, NONE) == EMPTY) std::cout << "Error at measurement pop() iter=" << iter << "\n";
+			else {
+				for (long iter_s = 0; iter_s < numSameOps; iter_s++) {
+					if (op(proot->dfc, pop, tid, POP_OP, EMPTY) == EMPTY) std::cout << "Error at measurement pop() iter=" << iter << "\n";
+				}
 			}
 		}
 		auto stopBeats = steady_clock::now();
@@ -821,7 +681,7 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		combining_counter += l_combining_counter;
 	};
 
-	auto randop_lambda = [&numThreads, &startFlag,&numPairs, &dfc,&list](nanoseconds *delta, const int tid) {
+	auto randop_lambda = [&numThreads, &startFlag,&numPairs, &proot, &pop](nanoseconds *delta, const int tid) {
 		size_t param = tid;
 		while (!startFlag.load()) {} // Spin until the startFlag is set
 		// Measurement phase
@@ -830,10 +690,10 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		for (long long iter = 0; iter < 2 * numPairs/numThreads; iter++) {
 			int randop = rand() % 2;         // randop in the range 0 to 1
 			if (randop == 0) {
-				op(dfc,list, tid, PUSH_OP, param);
+				op(proot->dfc, pop, tid, PUSH_OP, param);
 			}
 			else if (randop == 1) {
-				op(dfc,list, tid, POP_OP, NONE);
+				op(proot->dfc, pop, tid, POP_OP, EMPTY);
 			}
 		}
 		auto stopBeats = steady_clock::now();
@@ -846,71 +706,53 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		combining_counter += l_combining_counter;
 	};
 
-
 	for (int irun = 0; irun < numRuns; irun++) {
 		NN = numThreads;
 
-		/**
-		 * Create a persistent pool without using transactions
-		 *
-		 */
-		
-		size_t res_len;
-		int is_pmem;
-		
-	    if ((dfc = (detectable_fc *)pmem_map_file(pool_file_name2,sizeof(detectable_fc),PMEM_FILE_CREATE , S_IRUSR|S_IWUSR,&res_len,&is_pmem )) == NULL) {
-	    	perror("pmem_map");
-	    	exit(1);
-	    }
-		
-		/**
-		 * Allocate the list using transactions like before
-		 */
-		auto pool_obj = pool<detectable_list>::create(pool_file_name, "layout", (size_t)PM_REGION_SIZE, S_IRUSR|S_IWUSR);
-		list = pool_obj.root();
-		transaction_allocations(list, pool_obj);
+		for (int pid = 0; pid < NN; pid++) {
+			announce_arr[pid].epoch = NONE;
+			announce_arr[pid].name = NO_OP;
+			announce_arr[pid].param = NONE;
+			announce_arr[pid].activate = 0;
+			announce_arr[pid].valid = 0;
+		}
+
+		pop = pool<root>::create(pool_file_name, "layout", (size_t)PM_REGION_SIZE, S_IRUSR|S_IWUSR);
+		proot = pop.root();
+		transaction_allocations(proot, pop);
 		std::cout << "Finished allocating!" << std::endl;
 
 		// Fill the queue with an initial amount of nodes
 		size_t param = size_t(41);
 		for (uint64_t ielem = 0; ielem < kNumElements; ielem++) {
-			op(dfc,list, 0, PUSH_OP, param);
+			op(proot->dfc, pop, 2, PUSH_OP, param);
 		}
 		std::thread enqdeqThreads[numThreads];
-		#ifdef SAME100_BENCH
+		//#ifdef SAME100_BENCH
 		// for (int tid = 0; tid < numThreads; tid++) enqdeqThreads[tid] = std::thread(randop_lambda, &deltas[tid][irun], tid);
-		for (int tid = 0; tid < numThreads; tid++) enqdeqThreads[tid] = std::thread(pushpop_k_lambda, &deltas[tid][irun], tid);
-		#elif defined RANDOP
+		//for (int tid = 0; tid < numThreads; tid++) enqdeqThreads[tid] = std::thread(pushpop_k_lambda, &deltas[tid][irun], tid);
+		//#elif defined RANDOP
 		for (int tid = 0; tid < numThreads; tid++) enqdeqThreads[tid] = std::thread(randop_lambda, &deltas[tid][irun], tid);
-		#else
-		for (int tid = 0; tid < numThreads; tid++) enqdeqThreads[tid] = std::thread(pushpop_lambda, &deltas[tid][irun], tid);
-		#endif
+		//#else
+		//for (int tid = 0; tid < numThreads; tid++) enqdeqThreads[tid] = std::thread(pushpop_lambda, &deltas[tid][irun], tid);
+		//#endif
 		startFlag.store(true);
 		// Sleep for 2 seconds just to let the threads see the startFlag
-		std::this_thread::sleep_for(std::chrono::seconds(2));
+		std::this_thread::sleep_for(2s);
 		for (int tid = 0; tid < numThreads; tid++) enqdeqThreads[tid].join();
 		startFlag.store(false);
 
-		transaction_deallocations(list, pool_obj);
+		transaction_deallocations(proot, pop);
 		/* Cleanup */
 		/* Close persistent pool */
-		pool_obj.close ();
-		
-		/*
-         * Delete the mappings. The region is also
-         * automatically unmapped when the process is
-         * terminated.
-         */
-        pmem_unmap(dfc, sizeof(detectable_fc));
-		
+		pop.close ();
 		std::remove(pool_file_name);
-		std::remove(pool_file_name2);
 	}
 
 	// Sum up all the time deltas of all threads so we can find the median run
 	std::vector<nanoseconds> agg(numRuns);
 	for (int irun = 0; irun < numRuns; irun++) {
-		agg[irun] = std::chrono::seconds(0);
+		agg[irun] = 0ns;
 		for (int tid = 0; tid < numThreads; tid++) {
 			agg[irun] += deltas[tid][irun];
 		}
@@ -942,6 +784,7 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		localPwbCounter = 0; localPfenceCounter = 0; localParallelPwbCounter = 0; localParallelPfenceCounter = 0;
         return std::make_tuple(numPairs*2*NSEC_IN_SEC/median, pwbPerOp, pfencePerOp, pwbPerOp + pwbParallelPerOp, pfencePerOp + pfenceParallelPerOp, combiningPerOp);
 	#endif
+	std::cout << "done" <<std::endl;
 	return std::make_tuple(numPairs*2*NSEC_IN_SEC/median, 0, 0, 0, 0, 0);
 }
 
@@ -951,7 +794,7 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 int runSeveralTests() {
     const std::string dataFilename { DATA_FILE };
 	const std::string pdataFilename { PDATA_FILE };
-	std::vector<int> threadList = { 1, 16, 24, 36, 48,60,72,84,96 };     // For Castor
+	std::vector<int> threadList = { 1, 12, 24, 36, 48, 60, 72, 84, 96 };     // For Castor
     // std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 40};     // For Castor
 	// std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 64, 68, 72, 76, 80 };     // For Castor
     const int numRuns = 10;                                           // Number of runs
@@ -1013,17 +856,13 @@ int runSeveralTests() {
 }
 
 
-#ifdef NOT_READY
-int recoveryTest() {
+/*int recoveryTest() {
 	NN = 8;
-	pmem::obj::pool<detectable_list> pop;
-	pmem::obj::persistent_ptr<detectable_list> list;
-	detectable_fc* dfc;
+	pmem::obj::pool<root> pop;
+	pmem::obj::persistent_ptr<root> proot;
 
 	// const char* pool_file_name = "poolfile";
 	const char* pool_file_name = PM_FILE_NAME;
-	const char* pool_file_name2 = PM_FILE_NAME_2;
-	
     size_t params [NN];
     size_t ops [NN];
     std::thread threads_pool[NN];
@@ -1041,100 +880,72 @@ int recoveryTest() {
 		}
 	}
 	std::cout << std::endl;
-	
-	bool has_dfc= false;
-	if(is_file_exists(pool_file_name2)){
-		size_t res_len;
-		int is_pmem;
-		
-	    if ((dfc = (detectable_fc *)pmem_map_file(pool_file_name2,0,0 , S_IRUSR|S_IWUSR,&res_len,&is_pmem )) != NULL) {
-	    	has_dfc = true;
-	    }else{
-			
-		//create the pool
-	    if ((dfc = (detectable_fc *)pmem_map_file(pool_file_name2,sizeof(detectable_fc),PMEM_FILE_CREATE , S_IRUSR|S_IWUSR,&res_len,&is_pmem )) == NULL) {
-	    	perror("pmem_map");
-	    	exit(1);
-	    }
-		
-		}
-	}
 
-	if (has_dfc && is_file_exists(pool_file_name)) {
+	if (is_file_exists(pool_file_name)) {
 		// open a pmemobj pool
-		pop = pool<detectable_list>::open(pool_file_name, "layout");
-		list = pop.root();
-		
+		pop = pool<root>::open(pool_file_name, "layout");
+		proot = pop.root();
 
 		std::cout << "printing before recovering" << std::endl;
-		print_state(dfc,list);
+		print_state(proot->dfc);
 
         for (int pid=0; pid<NN; pid++) {
-            threads_pool[pid] = std::thread (recover, dfc, pid, ops[pid], params[pid]);
+            threads_pool[pid] = std::thread (recover, proot->dfc, pop, pid, ops[pid], params[pid]);
         }
 		for (int pid=0; pid<NN; pid++) {
 			threads_pool[pid].join();
 		}
-		print_state(dfc,list);
+		print_state(proot->dfc);
 		std::cout << "finished printing after recovering" << std::endl;
 
 
 		for (int pid=0; pid<NN; pid++) {
-			char nextOp = 1 - dfc->announce_arr[pid].valid % 10;
-			ANN(dfc, pid, nextOp).epoch = NONE; // change the last field:
-            threads_pool[pid] = std::thread (op, dfc, pid, ops[pid], params[pid]);
+			char nextOp = 1 - announce_arr[pid]->valid % 10;
+			ANN(proot->dfc, pid, nextOp)->epoch = NONE; // change the last field:
+            threads_pool[pid] = std::thread (op, proot->dfc, pop, pid, ops[pid], params[pid]);
         }
 		for (int pid=0; pid<NN; pid++) {
 			threads_pool[pid].join();
 		}
-		print_state(dfc,list);
+		print_state(proot->dfc);
 
-		transaction_deallocations(list, pop);
-		/* Cleanup */
-		/* Close persistent pool */
+		transaction_deallocations(proot, pop);
+		// Cleanup
+		// Close persistent pool
 		pop.close ();
-		pmem_unmap(dfc, sizeof(detectable_fc));
 		std::remove(pool_file_name);
-		std::remove(pool_file_name2);
 		return 1;
 	}
 	else {
 		// create a pmemobj pool
-		
-		/**
-		 * Allocate the list using transactions like before
-		 */
-		pop = pool<detectable_list>::create(pool_file_name, "layout", (size_t)PM_REGION_SIZE, S_IRUSR|S_IWUSR);
-		list = pop.root();
-		transaction_allocations(list, pop);
+		// pop = pool<root>::create(pool_file_name, "layout", PMEMOBJ_MIN_POOL);
+		pop = pool<root>::create(pool_file_name, "layout", PM_REGION_SIZE);
+		proot = pop.root();
+		transaction_allocations(proot, pop);
 		std::cout << "Finished allocating!" << std::endl;
 
 		for (int pid=0; pid<NN; pid++) {
-			char nextOp = 1 - dfc->announce_arr[pid].valid % 10;
-			// ANN(dfc, pid, nextOp).epoch = NONE;
-			ANN(dfc, pid, nextOp).name = NONE;
-            threads_pool[pid] = std::thread (op, dfc, pop, pid, ops[pid], params[pid]);
+			char nextOp = 1 - announce_arr[pid]->valid % 10;
+			// ANN(proot->dfc, pid, nextOp)->epoch = NONE;
+			ANN(proot->dfc, pid, nextOp)->name = NONE;
+            threads_pool[pid] = std::thread (op, proot->dfc, pop, pid, ops[pid], params[pid]);
         }
 		// usleep(1);
 		kill(getpid(), SIGKILL);
 		for (int pid=0; pid<NN; pid++) {
 			threads_pool[pid].join();
 		}
-		print_state(dfc,list);
+		print_state(proot->dfc);
 		return 0;
 	}
-}
-#endif
+}*/
+
 
 int main(int argc, char *argv[]) {
-
-	#ifdef SINGLE_NUMA
-		struct bitmask* mask = numa_bitmask_alloc(numa_num_possible_nodes());
-		numa_bitmask_setbit(mask, 0);
-		numa_bind(mask);
-		numa_bitmask_free(mask);
-	#endif
-
+	struct bitmask* mask = numa_bitmask_alloc(numa_num_possible_nodes());
+	numa_bitmask_setbit(mask, 0);
+	numa_bind(mask);
+	numa_bitmask_free(mask);
 	// recoveryTest();
 	runSeveralTests();
 }

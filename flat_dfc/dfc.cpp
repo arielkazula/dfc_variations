@@ -13,8 +13,8 @@
  * YIELD_WAIT
  */
 
-#define SINGLE_NUMA
-#define YIELD_WAIT
+//#define SINGLE_NUMA
+//#define YIELD_WAIT
 //#define YIELD_COMBINER_CPU
 //#define THREAD_PIN
 //#define YIELD_COMBINER_DONE
@@ -53,20 +53,39 @@ using namespace pmem;
 using namespace pmem::obj;
 using namespace std::chrono;
 
-#ifdef SAME100_BENCH
-#define DATA_FILE "../data/same100-green-pstack-ll-dfc.txt"
-#define PDATA_FILE "../data/same100-pwb-pfence-dfc.txt"
-#elif defined RANDOP
-#define DATA_FILE "../data/randop-green-pstack-ll-dfc.txt"
-#define PDATA_FILE "../data/randop-pwb-pfence-dfc.txt"
-#endif
 
-#ifndef DATA_FILE
-#define DATA_FILE "../data/green-pstack-ll-dfc.txt"
-#endif
-#ifndef PDATA_FILE
-#define PDATA_FILE "../data/pwb-pfence-dfc.txt"
-#endif
+#define SN ""  
+#define YW ""  
+#define YCD ""  
+#define TP ""  
+#define YCC ""  
+
+#ifdef SINGLE_NUMA
+#define SN "_1numa"  
+#endif // SINGLE_NUMA
+
+#ifdef YIELD_WAIT
+#define YW "_noBusyWait"  
+#endif // YIELD_WAIT
+
+
+#ifdef YIELD_COMBINER_DONE
+#define YCD "_yieldDone" 
+#endif // YIELD_COMBINER_DONE
+
+#ifdef THREAD_PIN
+#define TP "_pinning"  
+#endif // THREAD_PIN
+
+#ifdef YIELD_COMBINER_CPU
+#define YCC "_yieldOnlyWithComb" 
+#endif // YIELD_COMBINER_CPU
+
+#define PDATA_FILE "./data/count_dfc" YCC TP YCD YW SN ".txt"
+#define DATA_FILE "./data/dfc" YCC TP YCD YW SN ".txt"
+
+
+
 #ifndef PM_REGION_SIZE
 #define PM_REGION_SIZE 2*1024*1024*1024ULL // 2GB for now
 // #define PM_REGION_SIZE 1024*1024*128ULL
