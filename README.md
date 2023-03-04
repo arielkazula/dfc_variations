@@ -90,11 +90,11 @@ make clean ; rm -rf CMakeCache.txt /dev/shm/* CMakeFiles/ Makefile dfc  ; cmake 
   # Run the benchmark on Flat-Obj DFC stack code with different system configuration:
   
   Follow these steps:
-  ```bash
+```bash
 cd ./baseline
 make clean ; rm -rf CMakeCache.txt /dev/shm/* CMakeFiles/ Makefile dfc  ; cmake -DCMAKE_CXX_FLAGS="<enter here compile flags>" ; make ; >> /dev/null
 ./dfc
-    ```
+```
   
   The compilation flags are the same compilation flags as for the baseline case, as does the run.sh script.
   
