@@ -695,7 +695,11 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 		size_t param = tid;
 
 		#ifdef THREAD_PIN
-		synchThreadPin(tid % 20 ,tid);
+			#ifdef SINGLE_NUMA
+			synchThreadPin(tid % 10, tid);
+			#else
+			synchThreadPin(tid % 20 ,tid);
+			#endif
 		#endif
 
 		while (!startFlag.load()) {} // Spin until the startFlag is set

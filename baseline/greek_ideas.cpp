@@ -48,7 +48,7 @@ using namespace std::literals::chrono_literals;
 // Name of persistent file mapping
 #ifndef PM_FILE_NAME
 // #define PM_FILE_NAME   "/home/matanr/recov_flat_combining/poolfile"
-#define PM_FILE_NAME   "/opt/ext4/HAGIT/dfc_shared"
+#define PM_FILE_NAME   "/dev/shm/dfc_shared"
 // #define PM_FILE_NAME   "/dev/dax4.0"
 // #define PM_FILE_NAME   "/mnt/dfcpmem/dfc_shared"
 #endif
@@ -794,7 +794,7 @@ std::tuple<uint64_t, double, double, double, double, double> pushPopTest(int num
 int runSeveralTests() {
     const std::string dataFilename { DATA_FILE };
 	const std::string pdataFilename { PDATA_FILE };
-	std::vector<int> threadList = { 1, 12, 24, 36, 48, 60, 72, 84, 96 };     // For Castor
+	std::vector<int> threadList = { 1, 16, 24, 36, 48, 60, 72, 84, 96 };     // For Castor
     // std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 40};     // For Castor
 	// std::vector<int> threadList = { 1, 2, 4, 8, 10, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 64, 68, 72, 76, 80 };     // For Castor
     const int numRuns = 10;                                           // Number of runs
